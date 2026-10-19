@@ -7,3 +7,5 @@ out/
 *.step
 *.stp
 *.pdf
+.env
+hosting/gen/

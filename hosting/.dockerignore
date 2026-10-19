@@ -1,0 +1,14 @@
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+hosting/.env
+hosting/tests
+hosting/gen
+hosting/specs
+docs
+*.glb
+*.nwd
+*.step
+*.stp
+*.pdf

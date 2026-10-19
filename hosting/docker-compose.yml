@@ -1,0 +1,83 @@
+# Запуск:  cd hosting && cp .env.example .env && (отредактировать .env) && docker compose up -d --build
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-hardening: &hardening
+  restart: unless-stopped
+  logging: *logging
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  caddy:
+    <<: *hardening
+    image: caddy:2.9
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file: .env
+    cap_add:
+      - NET_BIND_SERVICE
+    tmpfs:
+      - /tmp:size=16m
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./app/templates/stub.html:/srv/stub/index.html:ro
+      - data:/srv/viewer:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    mem_limit: 256m
+    depends_on:
+      - app
+
+  app:
+    <<: *hardening
+    build:
+      context: ..
+      dockerfile: hosting/Dockerfile
+      args:
+        WITH_NWD: ${WITH_NWD:-1}
+    image: viewer-service:local
+    user: "10001:10001"
+    env_file: .env
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL:-https://${DOMAIN}}
+    volumes:
+      - data:/data
+    mem_limit: 512m
+    cpus: "0.5"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    <<: *hardening
+    image: viewer-service:local
+    pull_policy: never
+    user: "10001:10001"
+    command: ["python", "-m", "hosting_app.worker"]
+    env_file: .env
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL:-https://${DOMAIN}}
+    volumes:
+      - data:/data
+    mem_limit: 2g
+    memswap_limit: 4g
+    cpus: "1.5"
+    depends_on:
+      - app
+
+volumes:
+  data:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,79 @@
+{
+	email {$ACME_EMAIL}
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_body 30m
+			read_header 30s
+		}
+	}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Журнал доступа отключён: в пути запросов лежат секретные токены
+	log {
+		output discard
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Cross-Origin-Opener-Policy "same-origin"
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' data: blob:; worker-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+		X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex"
+		-Server
+	}
+
+	# Роботам: ничего не индексировать
+	handle /robots.txt {
+		respond "User-agent: *\nDisallow: /\n" 200
+	}
+
+	# Готовые страницы: чистая статика, без листинга каталогов
+	handle /m/* {
+		root * /srv/viewer/pages
+		uri strip_prefix /m
+		file_server
+	}
+
+	# Служебная проверка доступна только внутри docker-сети; снаружи — та же заглушка
+	handle /healthz {
+		root * /srv/stub
+		rewrite * /index.html
+		file_server
+	}
+
+	handle /api/* {
+		request_body {
+			max_size 310MB
+		}
+		reverse_proxy app:8000 {
+			flush_interval -1
+		}
+	}
+
+	handle /u/* {
+		reverse_proxy app:8000
+	}
+
+	handle /vendor/* {
+		reverse_proxy app:8000
+	}
+
+	# Корень и любой неизвестный адрес: одна и та же заглушка (без форм, ссылок и контактов)
+	handle {
+		root * /srv/stub
+		rewrite * /index.html
+		file_server
+	}
+
+	# Отсутствующая страница /m/<id>/ выглядит так же, как любой неизвестный адрес
+	handle_errors {
+		root * /srv/stub
+		rewrite * /index.html
+		file_server
+	}
+}

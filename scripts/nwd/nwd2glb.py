@@ -1,700 +1,528 @@
+#!/usr/bin/env python3
+# nwd2glb.py — группировка + инстансинг NWD-сцены в GLB
 import sys
-sys.stdout.reconfigure(encoding='utf-8')
-import json
-import struct
+import os
 import re
-import sys
-import collections
+import json
 import pathlib
+import array
+import collections
+import colorsys
 import numpy as np
 
-import colorsys
+import nwdscene as ns
+import glbemit
+
+# ---------- палитра (скопировано дословно из старого кода) ----------
 FAM = [("Приток", 212), ("Вытяжка", 24), ("Местный отсос", 300), ("Воздухозабор", 150), ("Выброс", 0),
        ("Холодоснабжение", 186), ("Система VRV", 270), ("Подпор", 95), ("Строительные", 45)]
+
+# воздушные системы, раньше попадавшие на запасной оттенок 60 (порядок k у прочих систем не меняется)
+FAM_AIR = [("Рекуператор", 170), ("Рециркуляция", 330), ("Техн.вент", 350)]
+
+
 def build_palette(names):
     out, seen = {}, {}
     for n in sorted(names):
         hue = next((h for p, h in FAM if n.startswith(p)), 60)
         k = seen.get(hue, 0); seen[hue] = k + 1
+        hue = next((h for p, h in FAM_AIR if n.startswith(p)), hue)
         h = (hue + (k % 5 - 2) * 9) / 360.0
         s = 0.9 if k % 2 == 0 else 0.75
         l = 0.42 + 0.07 * ((k // 2) % 3)
         out[n] = tuple(round(x, 3) for x in colorsys.hls_to_rgb(h, l, s))
     return out
+
+# цвет по категории для экземпляров без системы, у которых в NWD нейтральный (серый/белый) цвет
+CAT_COLORS = [("covering", (0.78, 0.70, 0.55)), ("изоляц", (0.78, 0.70, 0.55)),
+              ("terminal", (0.55, 0.72, 0.85)), ("воздухораспред", (0.55, 0.72, 0.85)),
+              ("обобщенн", (0.62, 0.62, 0.70)), ("обобщённ", (0.62, 0.62, 0.70))]
+
+
+def category_color(category, c):
+    """Цвет без системы: нейтральный цвет NWD заменяется цветом категории, настоящий цвет остаётся."""
+    if max(c) - min(c) > 0.05:
+        return c
+    low = category.lower()
+    return next((v for k, v in CAT_COLORS if k in low), c)
+
+
+# ---------- кватернион из матрицы вращения (метод Шеппарда) ----------
+def _quat_from_R(R):
+    """R: (N,3,3) -> Q: (N,4) xyzw, w>=0."""
+    N = R.shape[0]
+    tr = np.einsum('nii->n', R)
+    r00 = R[:, 0, 0]; r11 = R[:, 1, 1]; r22 = R[:, 2, 2]
+    r01 = R[:, 0, 1]; r10 = R[:, 1, 0]
+    r02 = R[:, 0, 2]; r20 = R[:, 2, 0]
+    r12 = R[:, 1, 2]; r21 = R[:, 2, 1]
+
+    Q = np.empty((N, 4), dtype=np.float64)
+    # ветка 0: tr макс
+    m0 = tr >= np.maximum(r00, np.maximum(r11, r22))
+    if np.any(m0):
+        s = 2.0 * np.sqrt(np.maximum(tr[m0] + 1.0, 0.0))
+        Q[m0, 3] = 0.25 * s
+        Q[m0, 0] = (r21[m0] - r12[m0]) / s
+        Q[m0, 1] = (r02[m0] - r20[m0]) / s
+        Q[m0, 2] = (r10[m0] - r01[m0]) / s
+    # ветка 1: r00 макс
+    m1 = (r00 > tr) & (r00 >= r11) & (r00 >= r22)
+    if np.any(m1):
+        s = 2.0 * np.sqrt(np.maximum(1.0 + r00[m1] - r11[m1] - r22[m1], 0.0))
+        Q[m1, 0] = 0.25 * s
+        Q[m1, 1] = (r01[m1] + r10[m1]) / s
+        Q[m1, 2] = (r02[m1] + r20[m1]) / s
+        Q[m1, 3] = (r21[m1] - r12[m1]) / s
+    # ветка 2: r11 макс
+    m2 = (r11 > tr) & (r11 > r00) & (r11 >= r22)
+    if np.any(m2):
+        s = 2.0 * np.sqrt(np.maximum(1.0 + r11[m2] - r00[m2] - r22[m2], 0.0))
+        Q[m2, 1] = 0.25 * s
+        Q[m2, 0] = (r01[m2] + r10[m2]) / s
+        Q[m2, 2] = (r12[m2] + r21[m2]) / s
+        Q[m2, 3] = (r02[m2] - r20[m2]) / s
+    # ветка 3: r22 макс
+    m3 = (r22 > tr) & (r22 > r00) & (r22 > r11)
+    if np.any(m3):
+        s = 2.0 * np.sqrt(np.maximum(1.0 + r22[m3] - r00[m3] - r11[m3], 0.0))
+        Q[m3, 2] = 0.25 * s
+        Q[m3, 0] = (r02[m3] + r20[m3]) / s
+        Q[m3, 1] = (r12[m3] + r21[m3]) / s
+        Q[m3, 3] = (r10[m3] - r01[m3]) / s
+
+    # нормировка
+    nrm = np.linalg.norm(Q, axis=1, keepdims=True)
+    nrm = np.where(nrm > 0, nrm, 1.0)
+    Q /= nrm
+    # знак: w >= 0
+    neg = Q[:, 3] < 0
+    if np.any(neg):
+        Q[neg] *= -1.0
+    return Q
+
+def _bake(verts, inds, A, t, nv):
+    """Запекает n экземпляров: мировые вершины float32, индексы со сдвигом nv, границы."""
+    n, vn = len(A), len(verts)
+    world = np.einsum('ij,nkj->nik', verts.astype(np.float64), A) + t[:, None, :]
+    tri = np.broadcast_to(inds.astype(np.uint32).reshape(-1, 3), (n, len(inds) // 3, 3)).copy()
+    mirror = np.linalg.det(A) < 0
+    if mirror.any():
+        tri[mirror] = tri[mirror][:, :, [0, 2, 1]]
+    tri += (nv + np.arange(n, dtype=np.uint32) * vn).astype(np.uint32)[:, None, None]
+    return world.reshape(-1, 3).astype(np.float32), tri.ravel(), world.min(axis=(0, 1)), world.max(axis=(0, 1))
+
+
+def _jnum(o):
+    """Сериализация numpy-скаляров."""
+    return o.item()
+
+
+# ---------- Group ----------
+class Group:
+    __slots__ = ('verts', 'inds', 'inst', 'instances', 'triangles')
+    def __init__(self):
+        self.verts = None
+        self.inds = None
+        self.inst = {}
+        self.instances = 0
+        self.triangles = 0
+
+# ---------- main ----------
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python nwd2glb.py DUMPDIR OUT.glb [REPORT.json]", file=sys.stderr)
+    sys.stdout.reconfigure(encoding='utf-8')
+
+    # --- аргументы ---
+    args = sys.argv[1:]
+    if len(args) < 2:
+        print("Использование: python nwd2glb.py DUMPDIR OUT.glb [REPORT.json] [--quant OUTQ.glb]", file=sys.stderr)
         sys.exit(1)
-    
-    dump_dir = pathlib.Path(sys.argv[1])
-    out_path = pathlib.Path(sys.argv[2])
-    report_path = pathlib.Path(sys.argv[3]) if len(sys.argv) > 3 else None
 
-    scene_path = dump_dir / "scene.json"
-    geoms_path = dump_dir / "geoms.bin"
+    dump_dir = pathlib.Path(args[0])
+    out_path = pathlib.Path(args[1])
+    report_path = None
+    quant_path = None
 
-    with open(scene_path, 'r', encoding='utf-8') as f:
-        scene = json.load(f)
-    
-    if not scene.get("models"):
+    rest = args[2:]
+    i = 0
+    while i < len(rest):
+        if rest[i] == '--quant':
+            if i + 1 >= len(rest):
+                print("Ошибка: --quant требует аргумента", file=sys.stderr)
+                sys.exit(1)
+            quant_path = pathlib.Path(rest[i + 1])
+            i += 2
+        else:
+            if report_path is None:
+                report_path = pathlib.Path(rest[i])
+            i += 1
+
+    # --- загрузка сцены ---
+    sc = ns.load_scene(dump_dir)
+    if sc.n_inst == 0:
         raise ValueError("No models found in scene.json")
-    
-    model = scene["models"][0]
-    name = model.get("name", "model")
-    mpu = model.get("meters_per_unit", 1.0)
-    if not isinstance(mpu, (int, float)) or mpu <= 0:
-        mpu = 1.0
 
-    nodes = model.get("nodes", [])
-    instances = model.get("instances", [])
-    PALETTE = build_palette(model.get("systems", []))
-    geoms = model.get("geoms", [])
-    overrides = scene.get("overrides", [])
+    # --- аннотации ---
+    hidden = ns.hidden_set(sc.overrides)
+    src_re = re.compile(r'\.(ifc|dwfx?|nwc|dwg|rvt)$', re.I)
+    hid, src = ns.annotate(sc, hidden, src_re)
+    ifc_ids = {s for s in np.unique(src[src >= 0]).tolist() if sc.names[s].lower().endswith('.ifc')}
+    a4, a5, fn = ns.annotate_categories(sc, src, ifc_ids)
 
-    # Build node structure
-    node_by_id = {n["id"]: n for n in nodes}
-    parent_map = {n["id"]: n.get("parent", -1) for n in nodes}
+    # --- палитра ---
+    PALETTE = build_palette(sc.systems)
 
-    # Determine hidden nodes
-    hidden = set()
-    for ov in overrides:
-        if "path" in ov:
-            path = ov["path"]
-            flags = ov.get("flags", 0)
-            mv = ov.get("mv", 0)
-            is_hidden = False
-            if mv == 1:
-                mask = flags & 0xFF
-                value = (flags >> 8) & 0xFF
-                if (mask & 1) and (value & 1):
-                    is_hidden = True
-            else:
-                if flags & 1:
-                    is_hidden = True
-            if is_hidden:
-                hidden.add(path)
-        elif "nodes" in ov:
-            ids = ov["nodes"]
-            flags = ov.get("flags", 0)
-            mv = ov.get("mv", 0)
-            is_hidden = False
-            if mv == 1:
-                mask = flags & 0xFF
-                value = (flags >> 8) & 0xFF
-                if (mask & 1) and (value & 1):
-                    is_hidden = True
-            else:
-                if flags & 1:
-                    is_hidden = True
-            if is_hidden:
-                for nid in ids:
-                    hidden.add(nid)
-
-    # Load geometry data
-    geom_data = {}
-    if geoms_path.exists():
-        with open(geoms_path, 'rb') as f:
-            data = f.read()
-        for g in geoms:
-            gid = g.get("id", 0)
-            pass
-        
-        # We will load on demand or pre-load all valid ones
-        for i, g in enumerate(geoms):
-            if g.get("type") == 94 and g.get("vn", 0) > 0 and g.get("in", 0) > 0:
-                vo = g["vo"]
-                vn = g["vn"]
-                io = g["io"]
-                in_count = g["in"]
-                
-                # Vertices: vn*3 float32
-                v_bytes = data[vo : vo + vn*3*4]
-                verts = np.frombuffer(v_bytes, dtype=np.float32).reshape(vn, 3).astype(np.float64)
-                
-                # Indices: in uint32
-                i_bytes = data[io : io + in_count*4]
-                inds = np.frombuffer(i_bytes, dtype=np.uint32)
-                
-                geom_data[i] = (verts, inds)
-
-    # Process instances
-    # Stats
+    # --- статистика ---
     stats = {
-        "nodes": len(nodes),
-        "instances_total": len(instances),
-        "visible_instances": 0,
-        "skipped_hidden": 0,
-        "skipped_no_geom": 0,
-        "skipped_not_tri": 0,
-        "skipped_empty": 0,
-        "triangles_written": 0,
-        "vertices_written": 0,
-        "sources": 0,
-        "categories": 0,
-        "color_groups": 0,
-        "materials": 0
+        'nodes': sc.n_nodes,
+        'instances_total': sc.n_inst,
+        'visible_instances': 0,
+        'skipped_hidden': 0,
+        'skipped_no_geom': 0,
+        'skipped_not_tri': 0,
+        'skipped_empty': 0,
+        'triangles_written': 0,
+        'vertices_written': 0,
+        'sources': 0,
+        'categories': 0,
+        'color_groups': 0,
+        'materials': 0,
+        'instanced_instances': 0,
+        'baked_instances': 0,
+        'unique_instanced_geoms': 0,
     }
 
-    # Grouping structure
-    # Key: (source_label, category, color_tuple, transparency)
-    # Value: { "verts": [], "inds": [], "instances": 0, "triangles": 0 }
-    groups = collections.defaultdict(lambda: {"verts": [], "inds": [], "instances": 0, "triangles": 0})
-    
-    # Source tracking for report
-    source_stats = collections.defaultdict(lambda: {"instances": 0, "triangles": 0, "categories": collections.defaultdict(lambda: {"instances": 0, "triangles": 0})})
-    
-    # Material tracking
-    materials = {} # key: (color, trans) -> index
+    # --- маски ---
+    # inst_path: (n_inst,) int, -1 если нет
+    inst_path = sc.inst_path
+    inst_geom = sc.inst_geom
+    inst_midx = sc.inst_midx
+    inst_sys = sc.inst_sys
 
-    # Regex for source
-    src_re = re.compile(r'\.(ifc|dwfx?|nwc|dwg|rvt)$', re.IGNORECASE)
-    cat_re = re.compile(r'\s*\(\d+\)$')
+    # скрытые: inst_path == -1 -> не скрыт
+    valid_path = inst_path >= 0
+    hidden_mask = np.zeros(sc.n_inst, dtype=bool)
+    hidden_mask[valid_path] = hid[inst_path[valid_path]]
 
-    # Global bounding box accumulation
-    all_min = np.array([np.inf, np.inf, np.inf])
-    all_max = np.array([-np.inf, -np.inf, -np.inf])
+    stats['skipped_hidden'] = int(hidden_mask.sum())
 
-    for inst in instances:
-        path = inst["path"]
-        geom_idx = inst["geom"]
-        
-        # Check visibility
-        # Chain from path to root
-        chain = []
-        cur = path
-        while cur != -1:
-            if cur not in node_by_id:
-                break
-            chain.append(cur)
-            cur = parent_map.get(cur, -1)
-        
-        # Check if any node in chain is hidden
-        is_hidden = False
-        for nid in chain:
-            if nid in hidden:
-                is_hidden = True
-                break
-        
-        if is_hidden:
-            stats["skipped_hidden"] += 1
-            continue
+    # среди не скрытых
+    not_hidden = ~hidden_mask
+    # geom == -1 -> skipped_no_geom
+    geom_invalid = (inst_geom == -1) | (inst_geom >= len(sc.gtype))
+    stats['skipped_no_geom'] = int((not_hidden & geom_invalid).sum())
 
-        # Check geometry
-        if geom_idx == -1:
-            stats["skipped_no_geom"] += 1
-            continue
-            
-        if geom_idx not in geom_data:
-            # Check if it was skipped due to type/vn/in
-            g = geoms[geom_idx] if geom_idx < len(geoms) else None
-            if g is None:
-                stats["skipped_no_geom"] += 1
-            elif g.get("type") != 94 or g.get("vn", 0) == 0 or g.get("in", 0) == 0:
-                stats["skipped_not_tri"] += 1
-            else:
-                stats["skipped_no_geom"] += 1
-            continue
+    # геометрия не годна по valid_geoms
+    valid_geoms = ns.valid_geoms(sc)
+    # valid_geoms: bool по геометриям
+    # для не скрытых с валидным geom: проверить valid_geoms[geom]
+    geom_ok_mask = np.zeros(sc.n_inst, dtype=bool)
+    valid_geom_idx = inst_geom[not_hidden & ~geom_invalid]
+    if len(valid_geom_idx) > 0:
+        geom_ok_mask[not_hidden & ~geom_invalid] = valid_geoms[valid_geom_idx]
 
-        verts, inds = geom_data[geom_idx]
-        
-        if len(verts) == 0 or len(inds) == 0:
-            stats["skipped_empty"] += 1
-            continue
+    # skipped_not_tri: не скрыт, geom валиден по индексу, но не в valid_geoms
+    stats['skipped_not_tri'] = int((not_hidden & ~geom_invalid & ~geom_ok_mask).sum())
 
-        # Determine Source and Category
-        # Chain is currently root-to-leaf? No, we built it leaf-to-root.
-        # My loop: cur=path, then parent... so chain is [path, parent, ..., root].
-        # Reverse it to get root-to-leaf.
-        chain_root_to_leaf = list(reversed(chain))
-        
-        # Find source node
-        source_node_id = None
-        source_name = None
-        for nid in chain_root_to_leaf:
-            n = node_by_id.get(nid)
-            if n:
-                nm = n.get("name", "")
-                if src_re.search(nm):
-                    source_node_id = nid
-                    source_name = nm
-                    break
-        
-        if source_node_id is None:
-            source_label = "Прочее"
-            # "rest of the chain starts after the root"
-            # If no source found, source is "Прочее".
-            # Rest = chain after source node. Since source is virtual/root?
-            # This implies the "source" is effectively the root, so rest is chain[1:]?
-            # Or does it mean the source is not part of the chain, so rest is the whole chain?
-            # "rest of the chain starts after the root" -> chain[1:]
-            rest = chain_root_to_leaf[1:] if len(chain_root_to_leaf) > 1 else []
-        else:
-            # Source label = name with extension removed
-            source_label = re.sub(src_re, '', source_name)
-            # Rest = chain after the source node
-            # Find index of source_node_id in chain_root_to_leaf
-            try:
-                idx = chain_root_to_leaf.index(source_node_id)
-                rest = chain_root_to_leaf[idx+1:]
-            except ValueError:
-                rest = []
+    # прочие без midx -> skipped_no_geom (уже учтено выше, но уточним)
+    # видимые = не скрыт & midx >= 0
+    vis = not_hidden & (inst_midx >= 0)
+    stats['visible_instances'] = int(vis.sum())
+    stats['skipped_empty'] = 0
 
-        # Determine Category
-        category = ""
-        if source_name and source_name.lower().endswith(".ifc"):
-            # category = names of rest[3] and rest[4] joined with " · "
-            # missing levels are skipped; empty names skipped.
-            # This phrasing is slightly ambiguous. "missing levels are skipped" usually means if index doesn't exist.
-            # "empty names skipped" means if name is empty, don't include it?
+    # --- кэш категорий ---
+    cat_cache = {}
+
+    def get_category(node):
+        s = src[node]
+        key = (s, a4[node], a5[node], fn[node])
+        if key in cat_cache:
+            return cat_cache[key]
+        if s != -1 and s in ifc_ids:
             parts = []
-            if len(rest) > 3:
-                nm3 = node_by_id.get(rest[3], {}).get("name", "")
-                if nm3:
-                    parts.append(nm3)
-            if len(rest) > 4:
-                nm4 = node_by_id.get(rest[4], {}).get("name", "")
-                if nm4:
-                    parts.append(nm4)
-            category = " · ".join(parts)
+            for aid in (a4[node], a5[node]):
+                if aid != -1 and sc.names[aid]:
+                    parts.append(sc.names[aid])
+            cat = " · ".join(parts)
         else:
-            # category = name of the first node in rest with a non-empty name, with trailing (digits) removed
-            for nid in rest:
-                nm = node_by_id.get(nid, {}).get("name", "")
-                if nm:
-                    category = cat_re.sub('', nm)
-                    break
-        
-        if not category:
-            category = "Без категории"
+            if fn[node] != -1:
+                cat = re.sub(r'\s*\(\d+\)$', '', sc.names[fn[node]])
+            else:
+                cat = ""
+        if not cat:
+            cat = "Без категории"
+        cat_cache[key] = cat
+        return cat
 
-        # Geometry Baking
-        m = inst.get("m", [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])
-        M = np.array(m, dtype=np.float64).reshape(4, 4).T # Column-major input -> Transpose to get row-major matrix for multiplication?
-        # If m is column-major, m[0..3] is col 0.
-        # Standard matrix multiplication: v' = M * v.
-        # If M is stored column-major in memory, and we reshape(4,4), we get a matrix where M[i,j] is element at row i, col j?
-        # numpy reshape is row-major by default.
-        # If input list is [c0r0, c0r1, c0r2, c0r3, c1r0...], and we reshape(4,4), we get:
-        # [[c0r0, c0r1, c0r2, c0r3],
-        #  [c1r0, c1r1, c1r2, c1r3], ...]
-        # This is NOT the standard matrix where M[i,j] is row i col j.
-        # The spec says: "M = numpy.array(m).reshape(4,4).T"
-        # Let's follow the spec exactly.
-        
-        # Homogeneous vertices
-        V = verts
-        V_h = np.hstack([V, np.ones((len(V), 1))])
-        
-        # World = M @ V_h
-        # If M is defined as above, we do M @ V_h.T ? Or V_h @ M.T?
-        # Standard: v' = M * v. In numpy, if v is column vector (4,1), M is (4,4), result is M @ v.
-        # If V_h is (N, 4), we want (N, 4) result.
-        # v'_i = sum_j M_ij v_j.
-        # In numpy: V_h @ M.T gives (N,4) where result[i,k] = sum_j V_h[i,j] M.T[j,k] = sum_j V_h[i,j] M[k,j].
-        # This is v' = M * v if M is the matrix.
-        # Let's check the spec's M definition again.
-        # "M = numpy.array(m).reshape(4,4).T"
-        # So world = M @ V_h.T -> (4, N). Then transpose back.
-        # Or simply: world = V_h @ M.T
-        
-        world = V_h @ M.T
-        
-        # Extract xyz
-        world_xyz = world[:, :3]
-        
-        # Scale
-        world_xyz = world_xyz * mpu
-        
-        # Z-up to Y-up: (x, y, z) -> (x, z, -y)
-        # Input is (x, y, z) in world coords (Z-up).
-        # Output (x, z, -y) in Y-up coords.
-        new_x = world_xyz[:, 0]
-        new_y = world_xyz[:, 2]
-        new_z = -world_xyz[:, 1]
-        
-        baked_verts = np.column_stack((new_x, new_y, new_z))
+    # --- накопление в бакеты ---
+    # bucket: dict group_key -> dict geom -> array('i') midx
+    bucket = collections.defaultdict(lambda: collections.defaultdict(lambda: array.array('i')))
+    source_stats = collections.defaultdict(lambda: {'instances': 0, 'triangles': 0, 'categories': collections.defaultdict(lambda: {'instances': 0, 'triangles': 0})})
 
-        # Check determinant for winding
-        # "det of the upper-left 3x3 of M"
-        # M is the matrix defined in spec.
-        det = np.linalg.det(M[:3, :3])
-        reverse_winding = det < 0
+    vis_idx = np.nonzero(vis)[0]
+    mpu = sc.mpu
+    gvn = sc.gvn
+    gin = sc.gin
 
-        # Group Key
-        c = inst.get("c", [1,1,1])
-        t = inst.get("t", 0.0)
-        sid = inst.get("s", -1)
-        sysname = model["systems"][sid] if 0 <= sid < len(model.get("systems", [])) else ""
+    for i in vis_idx:
+        node = inst_path[i]
+        geom = inst_geom[i]
+        midx = inst_midx[i]
+
+        # source
+        s = src[node]
+        if s == -1:
+            source_label = "Прочее"
+        else:
+            source_label = re.sub(src_re, '', sc.names[s])
+
+        # category
+        category = get_category(node)
+
+        # цвет/прозрачность
+        sid = inst_sys[i]
+        sysname = sc.systems[sid] if 0 <= sid < len(sc.systems) else ""
+        c = sc.inst_c[midx]
+        t = sc.inst_t[midx]
         if sysname:
             c = PALETTE[sysname]
-            if "Covering" in category:
-                t = 0.7  # изоляция полупрозрачная, чтобы был виден цвет воздуховода внутри
-        color_key = (round(c[0], 3), round(c[1], 3), round(c[2], 3))
-        trans_key = round(t, 2)
+        else:
+            c = category_color(category, c)
+        if "Covering" in category:
+            t = 0.4
+        color_key = (round(float(c[0]), 3), round(float(c[1]), 3), round(float(c[2]), 3))
+        trans_key = round(float(t), 2)
 
         group_key = (source_label, category, color_key, trans_key, sysname)
-        
-        # Update Group
-        g = groups[group_key]
-        base = g.get("nv", 0)
-        g["nv"] = base + len(baked_verts)
-        inds = inds.astype(np.int64) + base
-        g["verts"].append(baked_verts)
-        
-        # Indices
-        if reverse_winding:
-            # Swap 2nd and 3rd index of every triangle
-            # inds is flat array of uint32, length 3 * num_tris
-            inds_swapped = inds.copy()
-            inds_swapped[1::3] = inds[2::3]
-            inds_swapped[2::3] = inds[1::3]
-            inds = inds_swapped
-            
-        g["inds"].append(inds)
-        g["instances"] += 1
-        g["triangles"] += len(inds) // 3
 
-        # Update Source Stats
-        ss = source_stats[source_label]
-        ss["instances"] += 1
-        ss["triangles"] += len(inds) // 3
-        cat_stat = ss["categories"][category]
-        cat_stat["instances"] += 1
-        cat_stat["triangles"] += len(inds) // 3
+        # накопить
+        bucket[group_key][geom].append(midx)
 
-        # Update Global BBox
-        min_v = baked_verts.min(axis=0)
-        max_v = baked_verts.max(axis=0)
-        all_min = np.minimum(all_min, min_v)
-        all_max = np.maximum(all_max, max_v)
+        # статистика по источникам
+        tri_count = gin[geom] // 3
+        source_stats[source_label]['instances'] += 1
+        source_stats[source_label]['triangles'] += tri_count
+        source_stats[source_label]['categories'][category]['instances'] += 1
+        source_stats[source_label]['categories'][category]['triangles'] += tri_count
 
-        stats["visible_instances"] += 1
+    # --- обработка групп ---
+    mm = ns.open_geoms(sc)
 
-    # Finalize Groups
-    # Merge vertices and indices for each group
-    final_groups = {}
-    for key, data in groups.items():
-        if not data["verts"]:
-            continue
-        verts = np.vstack(data["verts"])
-        inds = np.concatenate(data["inds"])
-        
-        # Offset indices
-        # We need to assign global vertex offsets later?
-        # This implies each group has its own vertex buffer?
-        # "Group vertices as float32, indices as uint32 (use uint16 when the group has < 65536 vertices)."
-        # This suggests each group is a separate mesh/primitive with its own bufferView?
-        # Or one big buffer?
-        # "One material per (color, transparency)"
-        # "under each category one mesh node per color group"
-        # This implies each color group is a separate mesh.
-        # So each group has its own vertices and indices.
-        
-        # Determine index type
-        if len(verts) < 65536:
-            inds = inds.astype(np.uint16)
+    def read_geom(gi):
+        return ns.read_geom(sc, mm, gi)
+
+    # AABB кэш
+    aabb_cache = {}
+
+    def get_aabb(geom):
+        if geom in aabb_cache:
+            return aabb_cache[geom]
+        verts, _ = read_geom(geom)
+        if len(verts) == 0:
+            aabb_cache[geom] = (np.zeros(3), np.zeros(3))
+            return aabb_cache[geom]
+        mn = verts.min(axis=0)
+        mx = verts.max(axis=0)
+        aabb_cache[geom] = (mn, mx)
+        return aabb_cache[geom]
+
+    # P: Z-up -> Y-up
+    P = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
+
+    groups = {}
+    all_min = np.full(3, np.inf)
+    all_max = np.full(3, -np.inf)
+    has_verts = False
+
+    for group_key, geom_dict in bucket.items():
+        g = Group()
+        baked_verts_list = []
+        baked_inds_list = []
+        nv = 0
+
+        for geom, midx_arr in geom_dict.items():
+            midxs = np.array(midx_arr, dtype=np.int64)
+            N = len(midxs)
+            if N == 0:
+                continue
+
+            # матрицы
+            Mx = sc.inst_m[midxs]  # (N, 16)
+            mat = Mx.reshape(N, 4, 4)
+            Acol = mat[:, :3, :3].transpose(0, 2, 1)  # (N, 3, 3)
+            tcol = mat[:, 3, :3]  # (N, 3)
+
+            # мир
+            A = np.einsum('ij,njk->nik', P, Acol) * mpu  # (N, 3, 3)
+            t = tcol @ P.T * mpu  # (N, 3)
+
+            # разложение A = R * diag(S)
+            S = np.linalg.norm(A, axis=1)  # (N, 3)
+            S_safe = np.where(S > 1e-9, S, 1.0)
+            R = A / S_safe[:, None, :]  # (N, 3, 3)
+
+            # пригодность
+            det_R = np.linalg.det(R)
+            S_min = S.min(axis=1)
+            # max|R^T R - I|
+            RtR = np.einsum('nji,njk->nik', R, R)
+            I = np.eye(3)
+            err = np.abs(RtR - I).max(axis=(1, 2))
+            good = (det_R > 0) & (S_min > 1e-9) & (err <= 1e-6)
+
+            Ng = int(good.sum())
+            Nbad = N - Ng
+
+            # решение об инстансинге
+            vn = gvn[geom]
+            in_count = gin[geom]
+            do_instance = (not os.environ.get('NWD_NO_INSTANCING')) and (Ng >= 2) and ((Ng - 1) * (vn * 8 + in_count * 2) > Ng * 40 + 300)
+
+            if do_instance:
+                # инстансинг
+                T_inst = t[good]
+                Q_inst = _quat_from_R(R[good])
+                S_inst = S[good]
+                g.inst[geom] = (T_inst, Q_inst, S_inst)
+                g.instances += Ng
+                g.triangles += Ng * (in_count // 3)
+                stats['instanced_instances'] += Ng
+
+                # AABB для инстансинговых
+                mn, mx = get_aabb(geom)
+                corners = np.array([
+                    [mn[0], mn[1], mn[2]],
+                    [mn[0], mn[1], mx[2]],
+                    [mn[0], mx[1], mn[2]],
+                    [mn[0], mx[1], mx[2]],
+                    [mx[0], mn[1], mn[2]],
+                    [mx[0], mn[1], mx[2]],
+                    [mx[0], mx[1], mn[2]],
+                    [mx[0], mx[1], mx[2]],
+                ], dtype=np.float64)
+                # world = corner @ A.T + t
+                world_corners = np.einsum('ij,njk->nik', corners, A[good].transpose(0, 2, 1)) + T_inst[:, None, :]
+                wmin = world_corners.min(axis=(0, 1))
+                wmax = world_corners.max(axis=(0, 1))
+                all_min = np.minimum(all_min, wmin)
+                all_max = np.maximum(all_max, wmax)
+                has_verts = True
+
+            # запекание плохих (или всех, если не инстансим)
+            bad_mask = ~good if do_instance else np.ones(N, dtype=bool)
+            Nbad_actual = int(bad_mask.sum())
+            if Nbad_actual > 0:
+                bad_idx = np.nonzero(bad_mask)[0]
+                A_bad = A[bad_idx]
+                t_bad = t[bad_idx]
+
+                verts, inds = read_geom(geom)
+                if len(verts) == 0:
+                    continue
+                wv, wi, wmin, wmax = _bake(verts, inds, A[bad_idx], t[bad_idx], nv)
+                baked_verts_list.append(wv)
+                baked_inds_list.append(wi)
+                nv += len(verts) * Nbad_actual
+                g.instances += Nbad_actual
+                g.triangles += Nbad_actual * (in_count // 3)
+                stats['baked_instances'] += Nbad_actual
+                all_min = np.minimum(all_min, wmin)
+                all_max = np.maximum(all_max, wmax)
+                has_verts = True
+
+        # собрать Group
+        if baked_verts_list:
+            g.verts = np.concatenate(baked_verts_list).reshape(-1, 3).astype(np.float32)
+            g.inds = np.concatenate(baked_inds_list)
+            if len(g.verts) < 65536:
+                g.inds = g.inds.astype(np.uint16)
+            else:
+                g.inds = g.inds.astype(np.uint32)
+            del baked_verts_list
+            del baked_inds_list
         else:
-            inds = inds.astype(np.uint32)
-            
-        verts = verts.astype(np.float32)
-        
-        final_groups[key] = {
-            "verts": verts,
-            "inds": inds,
-            "instances": data["instances"],
-            "triangles": data["triangles"]
-        }
-        
-        stats["triangles_written"] += data["triangles"]
-        stats["vertices_written"] += len(verts)
+            g.verts = np.zeros((0, 3), dtype=np.float32)
+            g.inds = None
 
-    # Calculate Global Offset
-    # "Shift all coordinates so the global bounding-box center in X and Z is at 0 and the global minimum Y is 0"
-    offset = np.zeros(3)
-    if stats["vertices_written"] > 0:
-        center_xz = (all_min + all_max) / 2.0
-        offset[0] = -center_xz[0]
-        offset[2] = -center_xz[2]
-        offset[1] = -all_min[1]
-        
-        # Apply offset to all groups
-        for key in final_groups:
-            final_groups[key]["verts"] += offset
+        groups[group_key] = g
 
-    # Update stats
-    stats["sources"] = len(source_stats)
-    stats["categories"] = sum(len(ss["categories"]) for ss in source_stats.values())
-    stats["color_groups"] = len(final_groups)
-    
-    # Prepare Materials
-    # Key: (color, trans)
-    mat_keys = set()
-    for key in final_groups:
-        color = key[2]
-        trans = key[3]
-        mat_keys.add((color, trans))
-    
-    # Assign material indices
-    mat_list = []
-    mat_index_map = {}
-    for i, mk in enumerate(sorted(mat_keys)):
-        color = mk[0]
-        trans = mk[1]
-        mat = {
-            "pbrMetallicRoughness": {
-                "baseColorFactor": [color[0], color[1], color[2], 1.0 - trans],
-                "metallicFactor": 0.0,
-                "roughnessFactor": 0.8
-            },
-            "doubleSided": True
-        }
-        if trans > 0.01:
-            mat["alphaMode"] = "BLEND"
-        mat_list.append(mat)
-        mat_index_map[mk] = i
-    
-    stats["materials"] = len(mat_list)
+    # --- смещение ---
+    offset = np.zeros(3, dtype=np.float64)
+    if has_verts:
+        center = (all_min + all_max) / 2.0
+        offset = np.array([-center[0], -all_min[1], -center[2]], dtype=np.float64)
+        # применить к вершинам
+        for g in groups.values():
+            if len(g.verts) > 0:
+                g.verts = (g.verts.astype(np.float64) + offset).astype(np.float32)
+            # применить к инстансам
+            for geom, (T, Q, S) in g.inst.items():
+                g.inst[geom] = (T + offset, Q, S)
 
-    # Build glTF JSON
-    gltf = {
-        "asset": {"version": "2.0", "generator": "nwd2glb"},
-        "scene": 0,
-        "scenes": [{"nodes": []}],
-        "nodes": [],
-        "meshes": [],
-        "materials": mat_list,
-        "accessors": [],
-        "bufferViews": [],
-        "buffers": []
-    }
+    # --- итоговая статистика ---
+    stats['triangles_written'] = sum(g.triangles for g in groups.values())
+    stats['vertices_written'] = sum(len(g.verts) for g in groups.values())
+    stats['sources'] = len(source_stats)
+    stats['categories'] = sum(len(ss['categories']) for ss in source_stats.values())
+    stats['color_groups'] = len(groups)
+    materials = set()
+    for gk in groups.keys():
+        materials.add((gk[2], gk[3]))
+    stats['materials'] = len(materials)
+    stats['unique_instanced_geoms'] = sum(len(g.inst) for g in groups.values())
 
-    # We need to write the binary data first to know sizes, or build it in memory.
-    # Let's build the binary buffer in memory.
-    bin_data = bytearray()
-    
-    # Helper to add bufferView and accessor
-    def add_buffer_view(data, target=None):
-        # Align to 4 bytes
-        while len(bin_data) % 4 != 0:
-            bin_data.append(0)
-        offset = len(bin_data)
-        bin_data.extend(data)
-        bv = {
-            "buffer": 0,
-            "byteOffset": offset,
-            "byteLength": len(data)
-        }
-        if target:
-            bv["target"] = target
-        gltf["bufferViews"].append(bv)
-        return len(gltf["bufferViews"]) - 1
+    # --- emit ---
+    root_name = re.sub(r'\.[^.]*$', '', sc.name)
+    result = glbemit.emit(groups, read_geom, root_name, str(out_path), str(quant_path) if quant_path else None)
 
-    def add_accessor(bv_index, component_type, count, type_str, min_val=None, max_val=None):
-        acc = {
-            "bufferView": bv_index,
-            "componentType": component_type,
-            "count": count,
-            "type": type_str
-        }
-        if min_val is not None:
-            acc["min"] = min_val
-        if max_val is not None:
-            acc["max"] = max_val
-        gltf["accessors"].append(acc)
-        return len(gltf["accessors"]) - 1
+    # --- отчёт ---
+    sources_list = []
+    for label in sorted(source_stats.keys()):
+        ss = source_stats[label]
+        cats = []
+        for cat_name in sorted(ss['categories'].keys()):
+            cc = ss['categories'][cat_name]
+            cats.append({'name': cat_name, 'instances': cc['instances'], 'triangles': cc['triangles']})
+        sources_list.append({
+            'source': label,
+            'instances': ss['instances'],
+            'triangles': ss['triangles'],
+            'categories': cats,
+        })
 
-    # 5126: ARRAY_BUFFER, 34963: ELEMENT_ARRAY_BUFFER
-    TARGET_ARRAY_BUFFER = 34962
-    TARGET_ELEMENT_ARRAY_BUFFER = 34963
-
-    # Build Hierarchy
-    # Scene root node name = model name without extension
-    root_name = re.sub(r'\.[^.]*$', '', name)
-    
-    # Group final_groups by source and category
-    # Key: (source, category, color, trans)
-    source_cat_groups = collections.defaultdict(lambda: collections.defaultdict(list))
-    for key, data in final_groups.items():
-        source = key[0]
-        category = key[1]
-        color = key[2]
-        trans = key[3]
-        source_cat_groups[source][category].append((key, data))
-
-    # Create Nodes
-    # Root Node
-    root_node = {"name": root_name, "children": []}
-    gltf["nodes"].append(root_node)
-    root_node_idx = 0
-    gltf["scenes"][0]["nodes"].append(root_node_idx)
-
-    # Iterate sources
-    for source in sorted(source_cat_groups.keys()):
-        # Source Node
-        src_node = {"name": source, "children": []}
-        gltf["nodes"].append(src_node)
-        src_node_idx = len(gltf["nodes"]) - 1
-        root_node["children"].append(src_node_idx)
-
-        cats = source_cat_groups[source]
-        for category in sorted(cats.keys()):
-            # Category Node
-            cat_node = {"name": category, "children": []}
-            gltf["nodes"].append(cat_node)
-            cat_node_idx = len(gltf["nodes"]) - 1
-            src_node["children"].append(cat_node_idx)
-
-            # Color Groups under this category
-            groups_in_cat = cats[category]
-            # Sort by color/trans for consistent naming?
-            # Order? Probably consistent. Let's sort by key.
-            groups_in_cat.sort(key=lambda x: (x[0][2], x[0][3]))
-            
-            for k, (key, data) in enumerate(groups_in_cat, 1):
-                # Mesh Node
-                mesh_name = key[4] if key[4] else category
-                if not key[4] and len(groups_in_cat) > 1:
-                    mesh_name = f"{category} #{k}"
-                
-                # Create Mesh
-                # Vertices
-                verts = data["verts"]
-                inds = data["inds"]
-                
-                # Write Vertices
-                v_bytes = verts.tobytes()
-                v_bv = add_buffer_view(v_bytes, TARGET_ARRAY_BUFFER)
-                
-                # Accessor for Position
-                min_v = verts.min(axis=0).tolist()
-                max_v = verts.max(axis=0).tolist()
-                pos_acc = add_accessor(v_bv, 5126, len(verts), "VEC3", min_v, max_v)
-                
-                # Write Indices
-                i_bytes = inds.tobytes()
-                i_bv = add_buffer_view(i_bytes, TARGET_ELEMENT_ARRAY_BUFFER)
-                
-                # Accessor for Indices
-                if inds.dtype == np.uint16:
-                    comp_type = 5123
-                else:
-                    comp_type = 5125
-                ind_acc = add_accessor(i_bv, comp_type, len(inds), "SCALAR")
-                
-                # Material Index
-                mat_idx = mat_index_map[(key[2], key[3])]
-                
-                # Primitive
-                primitive = {
-                    "attributes": {"POSITION": pos_acc},
-                    "indices": ind_acc,
-                    "material": mat_idx,
-                    "mode": 4
-                }
-                
-                mesh = {
-                    "name": mesh_name,
-                    "primitives": [primitive]
-                }
-                gltf["meshes"].append(mesh)
-                mesh_idx = len(gltf["meshes"]) - 1
-                
-                # Node for Mesh
-                mesh_node = {
-                    "name": mesh_name,
-                    "mesh": mesh_idx
-                }
-                gltf["nodes"].append(mesh_node)
-                mesh_node_idx = len(gltf["nodes"]) - 1
-                if key[4]:
-                    sys_node = {"name": key[4], "children": [mesh_node_idx]}
-                    gltf["nodes"].append(sys_node)
-                    cat_node["children"].append(len(gltf["nodes"]) - 1)
-                else:
-                    cat_node["children"].append(mesh_node_idx)
-
-    # Buffer
-    gltf["buffers"] = [{"byteLength": len(bin_data)}]
-
-    # Serialize JSON
-    json_str = json.dumps(gltf, separators=(',', ':'))
-    json_bytes = json_str.encode('utf-8')
-    
-    # Pad JSON to 4 bytes
-    json_padding = (4 - (len(json_bytes) % 4)) % 4
-    json_bytes += b' ' * json_padding
-    
-    # Pad BIN to 4 bytes
-    bin_padding = (4 - (len(bin_data) % 4)) % 4
-    bin_data += b'\x00' * bin_padding
-
-    # GLB Header
-    # Magic: glTF (0x46546C67)
-    # Version: 2
-    # Length: total
-    total_length = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
-    
-    glb = bytearray()
-    glb.extend(struct.pack('<I', 0x46546C67)) # glTF
-    glb.extend(struct.pack('<I', 2)) # Version
-    glb.extend(struct.pack('<I', total_length)) # Length
-    
-    # JSON Chunk
-    glb.extend(struct.pack('<I', len(json_bytes)))
-    glb.extend(struct.pack('<I', 0x4E4F534A)) # JSON
-    glb.extend(json_bytes)
-    
-    # BIN Chunk
-    glb.extend(struct.pack('<I', len(bin_data)))
-    glb.extend(struct.pack('<I', 0x004E4942)) # BIN
-    glb.extend(bin_data)
-
-    # Write GLB
-    with open(out_path, 'wb') as f:
-        f.write(glb)
-
-    # Report
     report = {
-        "stats": stats,
-        "sources": [],
-        "bounding_box": {
-            "min": all_min.tolist() if stats["vertices_written"] > 0 else [0,0,0],
-            "max": all_max.tolist() if stats["vertices_written"] > 0 else [0,0,0]
+        'stats': stats,
+        'sources': sources_list,
+        'bounding_box': {
+            'min': [float(all_min[0]), float(all_min[1]), float(all_min[2])] if has_verts else [0.0, 0.0, 0.0],
+            'max': [float(all_max[0]), float(all_max[1]), float(all_max[2])] if has_verts else [0.0, 0.0, 0.0],
         },
-        "offset": offset.tolist(),
-        "glb_size": len(glb)
+        'offset': [float(offset[0]), float(offset[1]), float(offset[2])],
+        'glb_size': result['glb_size'],
     }
-    
-    # Add source details
-    for source in sorted(source_stats.keys()):
-        ss = source_stats[source]
-        src_entry = {
-            "source": source,
-            "instances": ss["instances"],
-            "triangles": ss["triangles"],
-            "categories": []
-        }
-        for cat_name in sorted(ss["categories"].keys()):
-            cs = ss["categories"][cat_name]
-            src_entry["categories"].append({
-                "name": cat_name,
-                "instances": cs["instances"],
-                "triangles": cs["triangles"]
-            })
-        report["sources"].append(src_entry)
+    if result.get('quant_size') is not None:
+        report['quant_size'] = result['quant_size']
+    if result.get('quant_max_err') is not None:
+        report['quant_max_err'] = result['quant_max_err']
+    report['instanced_nodes'] = result['instanced_nodes']
+    report['meshes'] = result['meshes']
 
-    # Print Report
-    print(json.dumps(report, indent=2, ensure_ascii=False))
-    
+    # печать
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=_jnum))
+
+    # запись в файл
     if report_path:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
         with open(report_path, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+            json.dump(report, f, ensure_ascii=False, indent=2, default=_jnum)
 
-if __name__ == "__main__":
+    return 0
+
+
+if __name__ == '__main__':
     try:
-        main()
-        sys.exit(0)
-    except Exception as e:
+        sys.exit(main())
+    except Exception:
         import traceback
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)

@@ -95,6 +95,7 @@ int run(int argc, char** argv) {
         nwd::Options opts;
         opts.threads = 0;
         opts.products = true;
+        opts.max_decoded_chunk = 512ull << 20;
         nwd::Document doc(input, opts);
         auto scene = doc.read_scene();
 

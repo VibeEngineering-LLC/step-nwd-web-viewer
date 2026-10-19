@@ -321,6 +321,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
 const $ = (id) => document.getElementById(id);
 const viewport = $('viewport');
@@ -498,6 +499,12 @@ function applyEdges() {
         const em = new THREE.LineBasicMaterial({ color: color.clone() });
         const line = new THREE.LineSegments(eg, em);
         line.name = '__edge';
+        if (m.isInstancedMesh) {
+          // рёбра повторяющейся детали рисуются теми же матрицами экземпляров (инстансинг шейдера three.js)
+          line.isInstancedMesh = true; line.instanceMatrix = m.instanceMatrix; line.count = m.count; line.instanceColor = null;
+          line.frustumCulled = false; line.boundingBox = null;
+          line.computeBoundingBox = () => { m.computeBoundingBox(); line.boundingBox = m.boundingBox; };
+        }
         m.add(line);
         m.userData.edge = line;
       } else {
@@ -789,10 +796,22 @@ function resize() {
 new ResizeObserver(resize).observe(viewport);
 resize();
 
+// Ближняя/дальняя плоскости по расстоянию до модели: при фиксированных 0.01…5000 буфер глубины (24 бита)
+// не различает поверхности ближе ~1 см на удалении 40 м (штриховка, мерцание). Сжатие диапазона возвращает точность.
+function fitDepthRange() {
+  if (!modelCenter) return;
+  const d = camera.position.distanceTo(modelCenter), r = modelRadius * 1.5;
+  const near = Math.max(0.05, (d - r) * 0.5), far = Math.max(d + r, near * 10);
+  if (Math.abs(near - camera.near) > 1e-6 || Math.abs(far - camera.far) > 1e-3) {
+    camera.near = near; camera.far = far; camera.updateProjectionMatrix();
+  }
+}
+
 // ---- Render loop ----
 renderer.setAnimationLoop((now) => {
   if (camAnim) camAnim(now);
   controls.update();
+  fitDepthRange();
   renderer.render(scene, camera);
 });
 
@@ -1253,7 +1272,7 @@ function fail(err) {
   showOverlay('Загрузка модели… 0%');
   try {
     const buffer = await loadBuffer();
-    new GLTFLoader().parse(buffer, '', (gltf) => {
+    new GLTFLoader().setMeshoptDecoder(MeshoptDecoder).parse(buffer, '', (gltf) => {
       try { finalize(gltf); } catch (e) { fail(e); }
     }, (err) => fail(err));
   } catch (e) {

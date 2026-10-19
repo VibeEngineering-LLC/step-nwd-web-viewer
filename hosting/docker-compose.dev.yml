@@ -1,0 +1,15 @@
+# Только для локальной отладки: код приложения монтируется с диска, пересборка образа не нужна.
+# Запуск:  docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+services:
+  app:
+    volumes:
+      - data:/data
+      - ./app:/app/hosting_app:ro
+      - ../scripts:/app/scripts:ro
+      - ../assets:/app/assets:ro
+  worker:
+    volumes:
+      - data:/data
+      - ./app:/app/hosting_app:ro
+      - ../scripts:/app/scripts:ro
+      - ../assets:/app/assets:ro

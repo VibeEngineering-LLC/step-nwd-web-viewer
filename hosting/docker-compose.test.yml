@@ -1,0 +1,17 @@
+# Прогон тестов без сети: docker compose -f docker-compose.test.yml run --rm tester
+services:
+  tester:
+    image: viewer-test:pinned
+    pull_policy: never
+    network_mode: none
+    user: "10001:10001"
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app
+      NWD_SCRIPTS: /app/scripts/nwd
+    volumes:
+      - ./app:/app/hosting_app:ro
+      - ./tests:/app/tests:ro
+      - ../scripts:/app/scripts:ro
+      - ../assets:/app/assets:ro
+    command: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "/app/tests"]
